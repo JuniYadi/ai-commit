@@ -1,0 +1,30 @@
+{
+  "name": "ai-commit",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "ai-commit": "./index.ts"
+  },
+  "scripts": {
+    "dev": "bun run index.ts",
+    "build:local": "bun build --compile ./index.ts --outfile ./dist/ai-commit",
+    "build:all": "bun run build:mac-arm64 && bun run build:mac-amd64 && bun run build:linux-amd64 && bun run build:linux-arm64",
+    "build:mac-arm64": "bun build --compile --target=bun-darwin-arm64 ./index.ts --outfile ./dist/ai-commit-macos-arm64",
+    "build:mac-amd64": "bun build --compile --target=bun-darwin-x64 ./index.ts --outfile ./dist/ai-commit-macos-amd64",
+    "build:linux-amd64": "bun build --compile --target=bun-linux-x64 ./index.ts --outfile ./dist/ai-commit-linux-amd64",
+    "build:linux-arm64": "bun build --compile --target=bun-linux-arm64 ./index.ts --outfile ./dist/ai-commit-linux-arm64",
+    "build:mac-x64": "bun run build:mac-amd64",
+    "build:linux-x64": "bun run build:linux-amd64"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^2.0.47",
+    "ai": "^6.0.185"
+  }
+}
