@@ -25,7 +25,7 @@ jobs:
             target: bun-linux-arm64
             output_name: ai-commit-linux-arm64
           - name: macos-amd64
-            runs_on: macos-13
+            runs_on: macos-15-intel
             target: bun-darwin-x64
             output_name: ai-commit-macos-amd64
           - name: macos-arm64
