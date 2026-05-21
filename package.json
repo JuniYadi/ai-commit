@@ -13,8 +13,8 @@
     "README.md"
   ],
   "bin": {
-    "ai-commit": "./bin/aic.cjs",
-    "aic": "./bin/aic.cjs"
+    "ai-commit": "bin/aic.cjs",
+    "aic": "bin/aic.cjs"
   },
   "scripts": {
     "dev": "bun run index.ts",
