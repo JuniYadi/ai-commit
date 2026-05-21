@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText } from "ai";
+import { generateText, jsonSchema, stepCountIs, tool } from "ai";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
@@ -47,11 +47,21 @@ type AiMetadata = {
 };
 
 type ApiMode = "chat" | "responses";
+type StagedFileDiff = {
+  path: string;
+  patch: string;
+};
+type FileDiffSummary = {
+  path: string;
+  summary: string;
+};
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_RESPONSES_PATH = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH = "/chat/completions";
+const DEFAULT_DIFF_PATCH_MAX_LENGTH = 6000;
+const DEFAULT_DIFF_SUMMARY_CONCURRENCY = 4;
 
 async function main() {
   const argv = Bun.argv.slice(2);
@@ -108,15 +118,21 @@ async function main() {
   await runGit(["add", "-A"]);
 
   const stagedFiles = await runGit(["diff", "--cached", "--name-only"]);
-  if (!stagedFiles.trim()) {
+  const stagedPaths = stagedFiles
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (stagedPaths.length === 0) {
     console.log("No staged changes after git add -A. Nothing to commit.");
     return;
   }
 
   const statusShort = await runGit(["status", "--short"]);
   const diffStat = await runGit(["diff", "--cached", "--stat"]);
-  const diffPatchRaw = await runGit(["diff", "--cached", "--no-color"]);
-  const diffPatch = truncate(diffPatchRaw, 18000);
+  const stagedDiffs = await collectStagedFileDiffs({
+    stagedPaths,
+    maxPatchLength: DEFAULT_DIFF_PATCH_MAX_LENGTH,
+  });
 
   const aiMetadata = await generateAiMetadata({
     model: options.model,
@@ -130,7 +146,7 @@ async function main() {
     baseBranch,
     statusShort,
     diffStat,
-    diffPatch,
+    stagedDiffs,
   });
 
   console.log("\nAI-generated metadata:");
@@ -741,7 +757,7 @@ async function generateAiMetadata(input: {
   baseBranch: string;
   statusShort: string;
   diffStat: string;
-  diffPatch: string;
+  stagedDiffs: StagedFileDiff[];
 }): Promise<AiMetadata> {
   const mockMetadata = Bun.env.AI_COMMIT_MOCK_METADATA_JSON;
   if (mockMetadata) {
@@ -758,6 +774,222 @@ async function generateAiMetadata(input: {
     );
   }
 
+  if (input.stagedDiffs.length === 0) {
+    throw new Error("No staged diff content found.");
+  }
+
+  try {
+    if (input.apiMode === "chat") {
+      return await generateAiMetadataViaToolWorkflow(input);
+    }
+  } catch (error) {
+    debugLog(
+      input.debug,
+      `Tool workflow failed (${error instanceof Error ? error.message : String(error)}). Falling back to direct summaries.`,
+    );
+  }
+
+  const fileSummaries = await summarizeStagedDiffs({
+    ...input,
+    stagedDiffs: input.stagedDiffs,
+  });
+  const metadataPrompt = buildMetadataPrompt({
+    branch: input.branch,
+    baseBranch: input.baseBranch,
+    statusShort: input.statusShort,
+    diffStat: input.diffStat,
+    summaries: fileSummaries,
+  });
+
+  if (input.apiMode === "responses") {
+    const rawText = await generateTextViaResponsesApi({
+      apiKey: input.apiKey,
+      baseUrl: input.baseUrl,
+      responsesPath: input.responsesPath,
+      model: input.model,
+      prompt: metadataPrompt,
+      debug: input.debug,
+    });
+    return parseAiMetadata(rawText);
+  }
+
+  const rawText = await generateTextViaChatCompletionsApi({
+    apiKey: input.apiKey,
+    baseUrl: input.baseUrl,
+    prompt: metadataPrompt,
+    model: input.model,
+    providerName: input.providerName,
+    debug: input.debug,
+  });
+  return parseAiMetadata(rawText);
+}
+
+async function generateAiMetadataViaToolWorkflow(input: {
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  providerName: string;
+  apiMode: ApiMode;
+  responsesPath: string;
+  debug: boolean;
+  branch: string;
+  baseBranch: string;
+  statusShort: string;
+  diffStat: string;
+  stagedDiffs: StagedFileDiff[];
+}): Promise<AiMetadata> {
+  const provider = createOpenAICompatible({
+    baseURL: input.baseUrl,
+    name: input.providerName,
+    apiKey: input.apiKey,
+    fetch: createDebugFetch(input.debug),
+  });
+
+  const diffMap = new Map(input.stagedDiffs.map((diff) => [diff.path, diff] as const));
+  const stagedFilesList = input.stagedDiffs.map((diff) => diff.path);
+
+  const toolPrompt = [
+    "You generate git commit and pull request metadata.",
+    "First call summarize_diffs exactly once using all staged files, then respond with STRICT JSON only.",
+    'JSON shape: {"commitMessage":"...","prTitle":"...","prBody":"..."}',
+    "Rules:",
+    "- commitMessage: single line, <= 72 chars, imperative mood.",
+    "- prTitle: single line, <= 72 chars.",
+    "- prBody: markdown with sections '## Summary' and '## Changes'.",
+    "- Content must be based only on git status, diff stat, and tool summaries.",
+    "",
+    `Base branch: ${input.baseBranch}`,
+    `Feature branch: ${input.branch}`,
+    "",
+    "Staged files:",
+    ...stagedFilesList.map((filePath) => `- ${filePath}`),
+    "",
+    "Git status --short:",
+    input.statusShort || "(empty)",
+    "",
+    "Git diff --cached --stat:",
+    input.diffStat || "(empty)",
+  ].join("\n");
+
+  const { text } = await generateText({
+    model: provider.chatModel(input.model),
+    prompt: toolPrompt,
+    temperature: 0.2,
+    toolChoice: { type: "tool", toolName: "summarize_diffs" },
+    stopWhen: stepCountIs(3),
+    tools: {
+      summarize_diffs: tool({
+        description: "Summarize staged git diffs per file for commit and PR generation.",
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: {
+            files: {
+              type: "array",
+              minItems: 1,
+              items: { type: "string" },
+              description: "List of staged file paths to summarize.",
+            },
+          },
+          required: ["files"],
+          additionalProperties: false,
+        }),
+        execute: async ({ files }) => {
+          const selected = Array.isArray(files)
+            ? files
+                .map((value) => String(value).trim())
+                .filter((value) => value && diffMap.has(value))
+            : [];
+          const effectiveFiles = selected.length > 0 ? selected : stagedFilesList;
+          const targetDiffs = effectiveFiles
+            .map((filePath) => diffMap.get(filePath))
+            .filter((value): value is StagedFileDiff => Boolean(value));
+          const summaries = await summarizeStagedDiffs({
+            ...input,
+            stagedDiffs: targetDiffs,
+          });
+          return { summaries };
+        },
+      }),
+    },
+  });
+
+  return parseAiMetadata(text);
+}
+
+async function summarizeStagedDiffs(input: {
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  providerName: string;
+  apiMode: ApiMode;
+  responsesPath: string;
+  debug: boolean;
+  stagedDiffs: StagedFileDiff[];
+}): Promise<FileDiffSummary[]> {
+  const concurrency = resolveSummaryConcurrency();
+  return mapWithConcurrency(input.stagedDiffs, concurrency, async (diff) => {
+    const summary = await summarizeSingleDiff({ ...input, diff });
+    return { path: diff.path, summary };
+  });
+}
+
+async function summarizeSingleDiff(input: {
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  providerName: string;
+  apiMode: ApiMode;
+  responsesPath: string;
+  debug: boolean;
+  diff: StagedFileDiff;
+}): Promise<string> {
+  const summaryPrompt = [
+    "Summarize the staged git diff for one file.",
+    "Return plain text only.",
+    "Rules:",
+    "- 1 sentence only.",
+    "- Max 180 characters.",
+    "- Mention concrete behavior or content changes, not generic wording.",
+    "",
+    `File: ${input.diff.path}`,
+    "",
+    "Diff:",
+    input.diff.patch || "(empty)",
+  ].join("\n");
+
+  const rawText =
+    input.apiMode === "responses"
+      ? await generateTextViaResponsesApi({
+          apiKey: input.apiKey,
+          baseUrl: input.baseUrl,
+          responsesPath: input.responsesPath,
+          model: input.model,
+          prompt: summaryPrompt,
+          debug: input.debug,
+        })
+      : await generateTextViaChatCompletionsApi({
+          apiKey: input.apiKey,
+          baseUrl: input.baseUrl,
+          prompt: summaryPrompt,
+          model: input.model,
+          providerName: input.providerName,
+          debug: input.debug,
+        });
+
+  const cleaned = sanitizeOneLine(rawText).replace(/^-+\s*/, "");
+  if (cleaned) {
+    return clamp(cleaned, 180);
+  }
+  return `Updated ${input.diff.path}.`;
+}
+
+function buildMetadataPrompt(input: {
+  branch: string;
+  baseBranch: string;
+  statusShort: string;
+  diffStat: string;
+  summaries: FileDiffSummary[];
+}): string {
   const prompt = [
     "You generate git commit and pull request metadata.",
     "Return STRICT JSON only. No markdown, no code fence, no extra text.",
@@ -777,31 +1009,40 @@ async function generateAiMetadata(input: {
     "Git diff --cached --stat:",
     input.diffStat || "(empty)",
     "",
-    "Git diff --cached --no-color (truncated):",
-    input.diffPatch || "(empty)",
+    "File-level staged diff summaries:",
+    ...input.summaries.map((item) => `- ${item.path}: ${item.summary}`),
   ].join("\n");
+  return prompt;
+}
 
-  if (input.apiMode === "responses") {
-    const rawText = await generateTextViaResponsesApi({
-      apiKey: input.apiKey,
-      baseUrl: input.baseUrl,
-      responsesPath: input.responsesPath,
-      model: input.model,
-      prompt,
-      debug: input.debug,
-    });
-    return parseAiMetadata(rawText);
+function resolveSummaryConcurrency(): number {
+  const rawValue = Bun.env.AI_COMMIT_SUMMARY_CONCURRENCY;
+  if (!rawValue) {
+    return DEFAULT_DIFF_SUMMARY_CONCURRENCY;
   }
 
-  const rawText = await generateTextViaChatCompletionsApi({
-    apiKey: input.apiKey,
-    baseUrl: input.baseUrl,
-    prompt,
-    model: input.model,
-    providerName: input.providerName,
-    debug: input.debug,
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error(
+      `Invalid AI_COMMIT_SUMMARY_CONCURRENCY value: '${rawValue}'. Use integer >= 1.`,
+    );
+  }
+  return Math.min(parsed, 12);
+}
+
+async function collectStagedFileDiffs(input: {
+  stagedPaths: string[];
+  maxPatchLength: number;
+}): Promise<StagedFileDiff[]> {
+  const results = await mapWithConcurrency(input.stagedPaths, 6, async (filePath) => {
+    const patch = await runGit(["diff", "--cached", "--no-color", "--", filePath]);
+    return {
+      path: filePath,
+      patch: truncate(patch, input.maxPatchLength),
+    };
   });
-  return parseAiMetadata(rawText);
+
+  return results.filter((item) => item.patch.trim().length > 0);
 }
 
 async function generateTextViaResponsesApi(input: {
@@ -1331,6 +1572,34 @@ async function runCommand(
   ]);
 
   return { exitCode, stdout, stderr };
+}
+
+async function mapWithConcurrency<T, U>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  const results = new Array<U>(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from({ length: Math.min(normalizedLimit, items.length) }, async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
 }
 
 function printHelp(): void {

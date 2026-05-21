@@ -4,7 +4,7 @@
 
 1. Creates/switches to a branch
 2. Stages all tracked and untracked changes
-3. Uses AI SDK (chat-completions) or OpenAI Responses API to generate commit + PR summary
+3. Summarizes staged diffs per file asynchronously, then generates commit + PR metadata
 4. Commits, pushes, and opens a PR using `gh`
 
 ## How It Works
@@ -15,9 +15,9 @@ flowchart TD
   B --> C[Validate tools: git, gh]
   C --> D[Resolve branches]
   D --> E[git add -A]
-  E --> F[Read staged status + diff]
-  F --> G[Call AI API]
-  G --> H[Generate commit + PR metadata]
+  E --> F[Read staged status + per-file diffs]
+  F --> G[Async per-file AI summaries]
+  G --> H[AI metadata generation]
   H --> I[git commit]
   I --> J[git push]
   J --> K{--no-pr or --current-branch?}
@@ -175,6 +175,7 @@ agent: generic
 - `AI_COMMIT_API_MODE` or `OPENAI_API_MODE` (`chat` or `responses`)
 - `AI_COMMIT_USE_RESPONSES_API` or `OPENAI_USE_RESPONSES_API` (`true`/`false`)
 - `AI_COMMIT_RESPONSES_PATH` or `OPENAI_RESPONSES_PATH` (default: `/responses`)
+- `AI_COMMIT_SUMMARY_CONCURRENCY` (default: `4`, max: `12`) controls parallel per-file AI summary calls
 - `AI_COMMIT_MOCK_METADATA_JSON` (optional, local testing without API calls)
 - `AI_COMMIT_DEBUG` (`true`/`false`, optional)
 
