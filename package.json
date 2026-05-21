@@ -4,6 +4,15 @@
   "description": "AI-powered git commit + PR CLI built with Bun",
   "module": "index.ts",
   "type": "module",
+  "repository": {
+    "url": "https://github.com/JuniYadi/ai-commit"
+  },
+  "maintainers": [
+    {
+      "email": "juniyadi94@gmail.com",
+      "name": "JuniYadi"
+    }
+  ],
   "publishConfig": {
     "access": "public"
   },
