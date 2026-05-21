@@ -1,6 +1,4 @@
 #!/usr/bin/env bun
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText } from "ai";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
@@ -19,6 +17,7 @@ type CommitCliOptions = {
   remote: string;
   noPr: boolean;
   dryRun: boolean;
+  debug: boolean;
 };
 
 type SkillAction = "install" | "update" | "remove";
@@ -50,6 +49,7 @@ type ApiMode = "chat" | "responses";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_RESPONSES_PATH = "/responses";
+const DEFAULT_CHAT_COMPLETIONS_PATH = "/chat/completions";
 
 async function main() {
   const argv = Bun.argv.slice(2);
@@ -65,6 +65,9 @@ async function main() {
     await runSkillCommand(options.skill);
     return;
   }
+
+  debugLog(options.debug, "Starting ai-commit in debug mode.");
+  debugLog(options.debug, `API mode=${options.apiMode} baseUrl=${options.baseUrl}`);
 
   await ensureToolExists("git");
   if (!options.noPr) {
@@ -120,6 +123,7 @@ async function main() {
     providerName: options.providerName,
     apiMode: options.apiMode,
     responsesPath: options.responsesPath,
+    debug: options.debug,
     branch: workingBranch,
     baseBranch,
     statusShort,
@@ -177,6 +181,7 @@ function parseArgs(argv: string[]): CliOptions {
   let remote = "origin";
   let noPr = false;
   let dryRun = false;
+  let debug = parseBooleanEnv(Bun.env.AI_COMMIT_DEBUG);
   let skillAction: SkillAction | undefined;
   let skillScope: SkillScope | undefined;
   let skillAgent: SkillAgent = "generic";
@@ -203,6 +208,11 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === "--dry-run") {
       dryRun = true;
+      continue;
+    }
+
+    if (arg === "--debug") {
+      debug = true;
       continue;
     }
 
@@ -330,7 +340,7 @@ function parseArgs(argv: string[]): CliOptions {
   }
 
   if (skillAction) {
-    if (branch || currentBranch || base || noPr || dryRun) {
+    if (branch || currentBranch || base || noPr || dryRun || debug) {
       throw new Error("`--skill` cannot be combined with branch/commit flags.");
     }
     if (!skillScope) {
@@ -378,6 +388,7 @@ function parseArgs(argv: string[]): CliOptions {
     remote,
     noPr,
     dryRun,
+    debug,
   };
 }
 
@@ -413,6 +424,21 @@ function getEnv(...keys: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+function parseBooleanEnv(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`Invalid AI_COMMIT_DEBUG value: '${value}'. Use true/false.`);
 }
 
 function parseApiMode(value: string, source = "api mode"): ApiMode {
@@ -547,12 +573,13 @@ function getSkillRelativeDirectory(agent: SkillAgent): string {
 
 function parseSkillFrontmatter(content: string): { name?: string; description?: string } {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  if (!match) {
+  const frontmatterBlock = match?.[1];
+  if (!frontmatterBlock) {
     throw new Error("Skill markdown must start with YAML frontmatter (--- ... ---).");
   }
 
   const fields: Record<string, string> = {};
-  for (const line of match[1].split(/\r?\n/)) {
+  for (const line of frontmatterBlock.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) {
       continue;
@@ -707,6 +734,7 @@ async function generateAiMetadata(input: {
   providerName: string;
   apiMode: ApiMode;
   responsesPath: string;
+  debug: boolean;
   branch: string;
   baseBranch: string;
   statusShort: string;
@@ -727,12 +755,6 @@ async function generateAiMetadata(input: {
       "Missing API key. Set OPENAI_API_KEY or AI_COMMIT_API_KEY, or pass --api-key.",
     );
   }
-
-  const provider = createOpenAICompatible({
-    name: input.providerName,
-    apiKey: input.apiKey,
-    baseURL: input.baseUrl,
-  });
 
   const prompt = [
     "You generate git commit and pull request metadata.",
@@ -764,17 +786,20 @@ async function generateAiMetadata(input: {
       responsesPath: input.responsesPath,
       model: input.model,
       prompt,
+      debug: input.debug,
     });
     return parseAiMetadata(rawText);
   }
 
-  const response = await generateText({
-    model: provider(input.model),
+  const rawText = await generateTextViaChatCompletionsApi({
+    apiKey: input.apiKey,
+    baseUrl: input.baseUrl,
     prompt,
-    temperature: 0.2,
+    model: input.model,
+    providerName: input.providerName,
+    debug: input.debug,
   });
-
-  return parseAiMetadata(response.text);
+  return parseAiMetadata(rawText);
 }
 
 async function generateTextViaResponsesApi(input: {
@@ -783,22 +808,35 @@ async function generateTextViaResponsesApi(input: {
   responsesPath: string;
   model: string;
   prompt: string;
+  debug: boolean;
 }): Promise<string> {
   const url = resolveUrl(input.baseUrl, input.responsesPath);
+  const requestBody = {
+    model: input.model,
+    input: input.prompt,
+    temperature: 0.2,
+  };
+  debugHttpRequest(input.debug, {
+    method: "POST",
+    url,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${maskSecret(input.apiKey)}`,
+    },
+    body: JSON.stringify(requestBody),
+  });
+
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${input.apiKey}`,
     },
-    body: JSON.stringify({
-      model: input.model,
-      input: input.prompt,
-      temperature: 0.2,
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   const bodyText = await response.text();
+  debugHttpResponse(input.debug, response, bodyText);
   if (!response.ok) {
     throw new Error(
       `Responses API request failed (${response.status} ${response.statusText}).\nbody:\n${truncate(bodyText, 4000)}`,
@@ -807,7 +845,9 @@ async function generateTextViaResponsesApi(input: {
 
   const parsed = safeParseJson(bodyText);
   if (!parsed) {
-    throw new Error("Responses API returned non-JSON body.");
+    throw new Error(
+      `Invalid JSON response from Responses API. body:\n${truncate(bodyText, 4000)}`,
+    );
   }
 
   const outputText = extractResponsesOutputText(parsed);
@@ -816,6 +856,66 @@ async function generateTextViaResponsesApi(input: {
   }
 
   throw new Error("Responses API returned no text output.");
+}
+
+async function generateTextViaChatCompletionsApi(input: {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  prompt: string;
+  providerName: string;
+  debug: boolean;
+}): Promise<string> {
+  const url = resolveUrl(input.baseUrl, DEFAULT_CHAT_COMPLETIONS_PATH);
+  const requestBody = {
+    model: input.model,
+    messages: [
+      {
+        role: "user",
+        content: input.prompt,
+      },
+    ],
+    temperature: 0.2,
+  };
+
+  debugHttpRequest(input.debug, {
+    method: "POST",
+    url,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${maskSecret(input.apiKey)}`,
+      "x-provider-name": input.providerName,
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${input.apiKey}`,
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const bodyText = await response.text();
+  debugHttpResponse(input.debug, response, bodyText);
+  if (!response.ok) {
+    throw new Error(
+      `Chat Completions API request failed (${response.status} ${response.statusText}).\nbody:\n${truncate(bodyText, 4000)}`,
+    );
+  }
+
+  const parsed = safeParseJson(bodyText);
+  if (!parsed) {
+    throw new Error(`Invalid JSON response from Chat Completions API.\nbody:\n${truncate(bodyText, 4000)}`);
+  }
+
+  const outputText = extractChatCompletionsText(parsed);
+  if (!outputText) {
+    throw new Error("Chat Completions API returned no text output.");
+  }
+  return outputText;
 }
 
 function resolveUrl(baseUrl: string, path: string): string {
@@ -865,9 +965,9 @@ function extractResponsesOutputText(payload: unknown): string | null {
         continue;
       }
 
-      const maybeText = (part as { text?: unknown }).text;
-      if (typeof maybeText === "string" && maybeText.trim()) {
-        chunks.push(maybeText.trim());
+      const maybeText = extractTextFromResponsePart(part);
+      if (maybeText) {
+        chunks.push(maybeText);
       }
     }
   }
@@ -877,6 +977,102 @@ function extractResponsesOutputText(payload: unknown): string | null {
   }
 
   return chunks.join("\n");
+}
+
+function extractTextFromResponsePart(part: unknown): string | null {
+  if (!part || typeof part !== "object") {
+    return null;
+  }
+
+  const maybeText = (part as { text?: unknown }).text;
+  if (typeof maybeText === "string" && maybeText.trim()) {
+    return maybeText.trim();
+  }
+
+  const typed = part as { type?: unknown };
+  if (typed.type !== "output_text") {
+    return null;
+  }
+
+  return typeof maybeText === "string" && maybeText.trim() ? maybeText.trim() : null;
+}
+
+function extractChatCompletionsText(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as { choices?: unknown };
+  if (!Array.isArray(record.choices) || record.choices.length === 0) {
+    return null;
+  }
+
+  const firstChoice = record.choices[0] as { message?: unknown } | undefined;
+  if (!firstChoice || typeof firstChoice !== "object") {
+    return null;
+  }
+
+  const message = firstChoice.message as { content?: unknown } | undefined;
+  const content = message?.content;
+  if (typeof content === "string" && content.trim()) {
+    return content.trim();
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const chunks: string[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    const text = (part as { text?: unknown }).text;
+    if (typeof text === "string" && text.trim()) {
+      chunks.push(text.trim());
+    }
+  }
+
+  return chunks.length > 0 ? chunks.join("\n") : null;
+}
+
+function maskSecret(value: string): string {
+  if (value.length <= 8) {
+    return "***";
+  }
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function debugLog(enabled: boolean, message: string): void {
+  if (!enabled) {
+    return;
+  }
+  console.error(`[debug] ${message}`);
+}
+
+function debugHttpRequest(
+  enabled: boolean,
+  request: { method: string; url: string; headers: Record<string, string>; body: string },
+): void {
+  if (!enabled) {
+    return;
+  }
+  debugLog(enabled, `Request ${request.method} ${request.url}`);
+  debugLog(enabled, `Request headers: ${JSON.stringify(request.headers)}`);
+  debugLog(enabled, `Request body: ${truncate(request.body, 4000)}`);
+}
+
+function debugHttpResponse(enabled: boolean, response: Response, bodyText: string): void {
+  if (!enabled) {
+    return;
+  }
+  const headers: Record<string, string> = {};
+  for (const [key, value] of response.headers.entries()) {
+    headers[key] = value;
+  }
+  debugLog(enabled, `Response status: ${response.status} ${response.statusText}`);
+  debugLog(enabled, `Response headers: ${JSON.stringify(headers)}`);
+  debugLog(enabled, `Response body: ${truncate(bodyText, 4000)}`);
 }
 
 function parseAiMetadata(rawText: string): AiMetadata {
@@ -1013,6 +1209,7 @@ Options:
   --remote <name>         Git remote name (default: origin)
   --no-pr                 Skip creating pull request
   --dry-run               Generate AI text but skip commit/push/pr
+  --debug                 Print API request/response diagnostics
   --scope <repo|user>     Skill target scope (required for --skill)
   --agent <name>          Skill agent: codex | claude | generic (default: generic)
   --file <path>           Skill markdown source (required for install/update)

@@ -91,6 +91,7 @@ Options:
 - `--remote <name>` git remote name (default: `origin`)
 - `--no-pr` skip PR creation
 - `--dry-run` only generate AI metadata
+- `--debug` print API request/response diagnostics (sensitive values are masked)
 
 ## Optional feature: `--skill`
 
@@ -175,6 +176,7 @@ agent: generic
 - `AI_COMMIT_USE_RESPONSES_API` or `OPENAI_USE_RESPONSES_API` (`true`/`false`)
 - `AI_COMMIT_RESPONSES_PATH` or `OPENAI_RESPONSES_PATH` (default: `/responses`)
 - `AI_COMMIT_MOCK_METADATA_JSON` (optional, local testing without API calls)
+- `AI_COMMIT_DEBUG` (`true`/`false`, optional)
 
 CLI args override environment variables.
 
@@ -213,6 +215,7 @@ When you push a tag like `v1.0.0`, GitHub Actions will:
 2. Use Node.js `20` and Bun in the workflow.
 3. Upload all binaries to the GitHub Release for that tag.
 4. Upload `checksums.txt` (SHA-256 for all release binaries).
+5. Publish `@juniyadi/ai-commit` to npm using GitHub OIDC trusted publishing.
 
 Tag and push example:
 
