@@ -1,10 +1,20 @@
 {
-  "name": "ai-commit",
+  "name": "@juniyadi/ai-commit",
+  "version": "0.1.0",
+  "description": "AI-powered git commit + PR CLI built with Bun",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.ts",
+    "bin",
+    "README.md"
+  ],
   "bin": {
-    "ai-commit": "./index.ts"
+    "ai-commit": "./bin/aic.cjs",
+    "aic": "./bin/aic.cjs"
   },
   "scripts": {
     "dev": "bun run index.ts",
@@ -16,6 +26,10 @@
     "build:linux-arm64": "bun build --compile --target=bun-linux-arm64 ./index.ts --outfile ./dist/ai-commit-linux-arm64",
     "build:mac-x64": "bun run build:mac-amd64",
     "build:linux-x64": "bun run build:linux-amd64"
+  },
+  "engines": {
+    "node": ">=18",
+    "bun": ">=1.1.0"
   },
   "devDependencies": {
     "@types/bun": "latest"

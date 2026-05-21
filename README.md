@@ -7,6 +7,25 @@
 3. Uses AI SDK (chat-completions) or OpenAI Responses API to generate commit + PR summary
 4. Commits, pushes, and opens a PR using `gh`
 
+## How It Works
+
+```mermaid
+flowchart TD
+  A[Run CLI: aic or ai-commit] --> B[Parse args + env]
+  B --> C[Validate tools: git, gh]
+  C --> D[Resolve branches]
+  D --> E[git add -A]
+  E --> F[Read staged status + diff]
+  F --> G[Call AI API]
+  G --> H[Generate commit + PR metadata]
+  H --> I[git commit]
+  I --> J[git push]
+  J --> K{--no-pr or --current-branch?}
+  K -- Yes --> L[Done]
+  K -- No --> M[gh pr create]
+  M --> L
+```
+
 ## Requirements
 
 - [Bun](https://bun.com)
@@ -14,10 +33,21 @@
 - `gh` (GitHub CLI) for PR creation
 - OpenAI-compatible API credentials
 
-## Install
+## Install (project development)
 
 ```bash
 bun install
+```
+
+## Install (npm package)
+
+```bash
+# run once without installing globally
+npx @juniyadi/ai-commit --help
+
+# install globally
+npm i -g @juniyadi/ai-commit
+aic --help
 ```
 
 ## Run in development
@@ -26,17 +56,20 @@ bun install
 bun run index.ts --branch feat/my-change
 ```
 
-## Run as command
+## Run as linked command (local)
 
 ```bash
 bun link
 ai-commit --branch feat/my-change
+aic --branch feat/my-change
 ```
 
 ## CLI usage
 
+`aic` and `ai-commit` are equivalent:
+
 ```bash
-ai-commit --branch <name> [options]
+aic --branch <name> [options]
 # or
 ai-commit --current-branch [options]
 ```
@@ -58,6 +91,79 @@ Options:
 - `--remote <name>` git remote name (default: `origin`)
 - `--no-pr` skip PR creation
 - `--dry-run` only generate AI metadata
+
+## Planned optional feature: `--skill`
+
+`--skill` is planned as an optional command family to install/update/remove skill markdown files.
+This section is the base usage/spec before implementation.
+
+### Goal
+
+- Manage reusable AI-agent skills in either repository scope or user scope.
+- Keep skill format generic so it works for Codex, Claude, or other agents.
+
+### Planned command shape
+
+```bash
+# install
+aic --skill install --file <path/to/skill.md> --scope <repo|user> [--agent <codex|claude|generic>] [--name <skill-name>] [--force]
+
+# update
+aic --skill update --file <path/to/skill.md> --scope <repo|user> [--agent <codex|claude|generic>] [--name <skill-name>] [--force]
+
+# remove
+aic --skill remove --name <skill-name> --scope <repo|user> [--agent <codex|claude|generic>]
+```
+
+### Planned scope resolution
+
+- `--scope repo`: install inside current repository.
+- `--scope user`: install in user-level skill directory.
+
+Default target directories:
+
+- `codex` + `repo`: `.codex/skills/`
+- `codex` + `user`: `~/.codex/skills/`
+- `claude` + `repo`: `.claude/skills/`
+- `claude` + `user`: `~/.claude/skills/`
+- `generic` + `repo`: `.skills/`
+- `generic` + `user`: `~/.skills/`
+
+### Base skill markdown format (agent-agnostic)
+
+```markdown
+---
+name: conventional-commit-writer
+description: Generate clear conventional commit messages from git diff.
+version: 1.0.0
+agent: generic
+---
+
+# conventional-commit-writer
+
+## Use when
+- You need a commit message from staged changes.
+
+## Inputs
+- `git diff --cached`
+- `git status --short`
+
+## Rules
+- Use Conventional Commits.
+- Keep subject <= 72 characters.
+- Mention breaking changes explicitly.
+
+## Output
+- Single commit message with optional body.
+```
+
+### Planned behavior notes
+
+- `install` fails if target exists, unless `--force` is set.
+- `update` fails if target does not exist, unless `--force` is set (create).
+- `remove` deletes target skill markdown from resolved directory.
+- `--name` overrides filename derived from markdown `name`.
+- Validate markdown has required fields: `name`, `description`.
 
 ## Environment variables
 
