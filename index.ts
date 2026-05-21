@@ -1,8 +1,12 @@
 #!/usr/bin/env bun
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, extname, join, resolve } from "node:path";
 
-type CliOptions = {
+type CommitCliOptions = {
+  mode: "commit";
   branch?: string;
   currentBranch: boolean;
   base?: string;
@@ -16,6 +20,24 @@ type CliOptions = {
   noPr: boolean;
   dryRun: boolean;
 };
+
+type SkillAction = "install" | "update" | "remove";
+type SkillScope = "repo" | "user";
+type SkillAgent = "codex" | "claude" | "generic";
+
+type SkillCliOptions = {
+  mode: "skill";
+  skill: {
+    action: SkillAction;
+    scope: SkillScope;
+    agent: SkillAgent;
+    file?: string;
+    name?: string;
+    force: boolean;
+  };
+};
+
+type CliOptions = CommitCliOptions | SkillCliOptions;
 
 type AiMetadata = {
   commitMessage: string;
@@ -38,6 +60,11 @@ async function main() {
   }
 
   const options = parseArgs(argv);
+
+  if (options.mode === "skill") {
+    await runSkillCommand(options.skill);
+    return;
+  }
 
   await ensureToolExists("git");
   if (!options.noPr) {
@@ -150,6 +177,12 @@ function parseArgs(argv: string[]): CliOptions {
   let remote = "origin";
   let noPr = false;
   let dryRun = false;
+  let skillAction: SkillAction | undefined;
+  let skillScope: SkillScope | undefined;
+  let skillAgent: SkillAgent = "generic";
+  let skillFile: string | undefined;
+  let skillName: string | undefined;
+  let force = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -173,8 +206,53 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === "--force") {
+      force = true;
+      continue;
+    }
+
     const [flag, inlineValue] = splitFlag(arg);
     const value = inlineValue ?? argv[index + 1];
+
+    if (flag === "--skill") {
+      skillAction = parseSkillAction(requireValue(flag, value), flag);
+      if (!inlineValue) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (flag === "--scope") {
+      skillScope = parseSkillScope(requireValue(flag, value), flag);
+      if (!inlineValue) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (flag === "--agent") {
+      skillAgent = parseSkillAgent(requireValue(flag, value), flag);
+      if (!inlineValue) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (flag === "--file") {
+      skillFile = requireValue(flag, value);
+      if (!inlineValue) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (flag === "--name") {
+      skillName = requireValue(flag, value);
+      if (!inlineValue) {
+        index += 1;
+      }
+      continue;
+    }
 
     if (flag === "--branch") {
       branch = requireValue(flag, value);
@@ -251,11 +329,43 @@ function parseArgs(argv: string[]): CliOptions {
     throw new Error(`Unknown flag: ${arg}`);
   }
 
+  if (skillAction) {
+    if (branch || currentBranch || base || noPr || dryRun) {
+      throw new Error("`--skill` cannot be combined with branch/commit flags.");
+    }
+    if (!skillScope) {
+      throw new Error("Missing required flag for --skill: --scope <repo|user>.");
+    }
+    if ((skillAction === "install" || skillAction === "update") && !skillFile) {
+      throw new Error(`--skill ${skillAction} requires --file <path/to/skill.md>.`);
+    }
+    if (skillAction === "remove" && !skillName) {
+      throw new Error("--skill remove requires --name <skill-name>.");
+    }
+
+    return {
+      mode: "skill",
+      skill: {
+        action: skillAction,
+        scope: skillScope,
+        agent: skillAgent,
+        file: skillFile,
+        name: skillName,
+        force,
+      },
+    };
+  }
+
+  if (skillScope || skillFile || skillName || force || skillAgent !== "generic") {
+    throw new Error("`--scope`, `--agent`, `--file`, `--name`, and `--force` require `--skill`.");
+  }
+
   if (!branch && !currentBranch) {
     throw new Error("Missing required flag: --branch <name> (or use --current-branch).");
   }
 
   return {
+    mode: "commit",
     branch,
     currentBranch,
     base,
@@ -269,6 +379,30 @@ function parseArgs(argv: string[]): CliOptions {
     noPr,
     dryRun,
   };
+}
+
+function parseSkillAction(value: string, source: string): SkillAction {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "install" || normalized === "update" || normalized === "remove") {
+    return normalized;
+  }
+  throw new Error(`Invalid ${source}: '${value}'. Use install, update, or remove.`);
+}
+
+function parseSkillScope(value: string, source: string): SkillScope {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "repo" || normalized === "user") {
+    return normalized;
+  }
+  throw new Error(`Invalid ${source}: '${value}'. Use repo or user.`);
+}
+
+function parseSkillAgent(value: string, source: string): SkillAgent {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "codex" || normalized === "claude" || normalized === "generic") {
+    return normalized;
+  }
+  throw new Error(`Invalid ${source}: '${value}'. Use codex, claude, or generic.`);
 }
 
 function getEnv(...keys: string[]): string | undefined {
@@ -330,6 +464,141 @@ function requireValue(flag: string, value: string | undefined): string {
     throw new Error(`Missing value for ${flag}`);
   }
   return value;
+}
+
+async function runSkillCommand(options: SkillCliOptions["skill"]): Promise<void> {
+  const targetDir = resolveSkillDirectory(options.scope, options.agent);
+
+  if (options.action === "remove") {
+    const normalizedName = normalizeSkillName(options.name ?? "");
+    const targetPath = join(targetDir, `${normalizedName}.md`);
+    const exists = await pathExists(targetPath);
+    if (!exists) {
+      if (options.force) {
+        console.log(`Skill '${normalizedName}' not found at ${targetPath}. Nothing to remove.`);
+        return;
+      }
+      throw new Error(`Skill '${normalizedName}' not found at ${targetPath}.`);
+    }
+
+    await rm(targetPath);
+    console.log(`Removed skill '${normalizedName}' from ${targetPath}`);
+    return;
+  }
+
+  const sourcePath = resolve(options.file ?? "");
+  const sourceInfo = await stat(sourcePath).catch(() => null);
+  if (!sourceInfo || !sourceInfo.isFile()) {
+    throw new Error(`Skill source file not found: ${sourcePath}`);
+  }
+
+  const content = await readFile(sourcePath, "utf8");
+  const metadata = parseSkillFrontmatter(content);
+  if (!metadata.name) {
+    throw new Error("Skill markdown must include frontmatter field: name");
+  }
+  if (!metadata.description) {
+    throw new Error("Skill markdown must include frontmatter field: description");
+  }
+
+  const normalizedName = normalizeSkillName(options.name ?? metadata.name);
+  const targetPath = join(targetDir, `${normalizedName}.md`);
+  const exists = await pathExists(targetPath);
+
+  if (options.action === "install" && exists && !options.force) {
+    throw new Error(`Skill '${normalizedName}' already exists at ${targetPath}. Use --force to overwrite.`);
+  }
+
+  if (options.action === "update" && !exists && !options.force) {
+    throw new Error(`Skill '${normalizedName}' does not exist at ${targetPath}. Use --force to create.`);
+  }
+
+  await mkdir(dirname(targetPath), { recursive: true });
+  await writeFile(targetPath, content, "utf8");
+
+  if (options.action === "install") {
+    console.log(`Installed skill '${normalizedName}' to ${targetPath}`);
+    return;
+  }
+
+  if (exists) {
+    console.log(`Updated skill '${normalizedName}' at ${targetPath}`);
+    return;
+  }
+
+  console.log(`Created skill '${normalizedName}' at ${targetPath}`);
+}
+
+function resolveSkillDirectory(scope: SkillScope, agent: SkillAgent): string {
+  const root = scope === "repo" ? process.cwd() : homedir();
+  const relative = getSkillRelativeDirectory(agent);
+  return resolve(root, relative);
+}
+
+function getSkillRelativeDirectory(agent: SkillAgent): string {
+  if (agent === "codex") {
+    return ".codex/skills";
+  }
+  if (agent === "claude") {
+    return ".claude/skills";
+  }
+  return ".skills";
+}
+
+function parseSkillFrontmatter(content: string): { name?: string; description?: string } {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) {
+    throw new Error("Skill markdown must start with YAML frontmatter (--- ... ---).");
+  }
+
+  const fields: Record<string, string> = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const separatorIndex = trimmed.indexOf(":");
+    if (separatorIndex < 1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim().toLowerCase();
+    const rawValue = trimmed.slice(separatorIndex + 1).trim();
+    const value = rawValue.replace(/^["']/, "").replace(/["']$/, "").trim();
+    if (key && value) {
+      fields[key] = value;
+    }
+  }
+
+  return {
+    name: fields.name,
+    description: fields.description,
+  };
+}
+
+function normalizeSkillName(rawValue: string): string {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    throw new Error("Skill name cannot be empty.");
+  }
+
+  const fromFilename = trimmed.replace(extname(trimmed), "");
+  const normalized = fromFilename.toLowerCase().replace(/\s+/g, "-");
+  if (!/^[a-z0-9._-]+$/.test(normalized) || normalized.includes("..") || /[\\/]/.test(normalized)) {
+    throw new Error(
+      `Invalid skill name '${rawValue}'. Use letters, numbers, dot, underscore, and dash only.`,
+    );
+  }
+  return normalized;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function ensureToolExists(name: string): Promise<void> {
@@ -726,10 +995,12 @@ function printHelp(): void {
 
 Usage:
   ai-commit (--branch <name> | --current-branch) [options]
+  ai-commit --skill <install|update|remove> --scope <repo|user> [options]
 
 Required:
   --branch <name>         Branch to create/switch and push
   --current-branch        Commit/push current branch and skip PR creation
+  --skill <action>        Optional skill manager: install | update | remove
 
 Options:
   --base <branch>         Base branch for PR (default: remote HEAD, then current branch)
@@ -742,6 +1013,11 @@ Options:
   --remote <name>         Git remote name (default: origin)
   --no-pr                 Skip creating pull request
   --dry-run               Generate AI text but skip commit/push/pr
+  --scope <repo|user>     Skill target scope (required for --skill)
+  --agent <name>          Skill agent: codex | claude | generic (default: generic)
+  --file <path>           Skill markdown source (required for install/update)
+  --name <name>           Skill name; also target filename without .md
+  --force                 Overwrite existing skill for install/update; ignore missing on remove
   -h, --help              Show this help
 `);
 }

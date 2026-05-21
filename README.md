@@ -92,17 +92,16 @@ Options:
 - `--no-pr` skip PR creation
 - `--dry-run` only generate AI metadata
 
-## Planned optional feature: `--skill`
+## Optional feature: `--skill`
 
-`--skill` is planned as an optional command family to install/update/remove skill markdown files.
-This section is the base usage/spec before implementation.
+`--skill` is an optional command family to install/update/remove skill markdown files.
 
 ### Goal
 
 - Manage reusable AI-agent skills in either repository scope or user scope.
 - Keep skill format generic so it works for Codex, Claude, or other agents.
 
-### Planned command shape
+### Command shape
 
 ```bash
 # install
@@ -115,7 +114,7 @@ aic --skill update --file <path/to/skill.md> --scope <repo|user> [--agent <codex
 aic --skill remove --name <skill-name> --scope <repo|user> [--agent <codex|claude|generic>]
 ```
 
-### Planned scope resolution
+### Scope resolution
 
 - `--scope repo`: install inside current repository.
 - `--scope user`: install in user-level skill directory.
@@ -157,12 +156,13 @@ agent: generic
 - Single commit message with optional body.
 ```
 
-### Planned behavior notes
+### Behavior notes
 
 - `install` fails if target exists, unless `--force` is set.
 - `update` fails if target does not exist, unless `--force` is set (create).
 - `remove` deletes target skill markdown from resolved directory.
 - `--name` overrides filename derived from markdown `name`.
+- `--agent` defaults to `generic` when omitted.
 - Validate markdown has required fields: `name`, `description`.
 
 ## Environment variables
