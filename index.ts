@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { generateText } from "ai";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
@@ -843,7 +845,7 @@ async function generateTextViaResponsesApi(input: {
     );
   }
 
-  const parsed = safeParseJson(bodyText);
+  const parsed = parseJsonPayload(bodyText);
   if (!parsed) {
     throw new Error(
       `Invalid JSON response from Responses API. body:\n${truncate(bodyText, 4000)}`,
@@ -866,6 +868,39 @@ async function generateTextViaChatCompletionsApi(input: {
   providerName: string;
   debug: boolean;
 }): Promise<string> {
+  try {
+    const provider = createOpenAICompatible({
+      baseURL: input.baseUrl,
+      name: input.providerName,
+      apiKey: input.apiKey,
+      fetch: createDebugFetch(input.debug),
+    });
+    const { text } = await generateText({
+      model: provider.chatModel(input.model),
+      prompt: input.prompt,
+      temperature: 0.2,
+    });
+    const outputText = text?.trim() ?? "";
+    if (!outputText) {
+      throw new Error("Chat Completions API returned no text output via AI SDK.");
+    }
+    return outputText;
+  } catch (error) {
+    debugLog(
+      input.debug,
+      `AI SDK chat call failed (${error instanceof Error ? error.message : String(error)}). Falling back to direct HTTP request.`,
+    );
+    return generateTextViaChatCompletionsHttp(input);
+  }
+}
+
+async function generateTextViaChatCompletionsHttp(input: {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  prompt: string;
+  debug: boolean;
+}): Promise<string> {
   const url = resolveUrl(input.baseUrl, DEFAULT_CHAT_COMPLETIONS_PATH);
   const requestBody = {
     model: input.model,
@@ -884,7 +919,7 @@ async function generateTextViaChatCompletionsApi(input: {
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${maskSecret(input.apiKey)}`,
-      "x-provider-name": input.providerName,
+      "x-fallback-mode": "direct-http",
     },
     body: JSON.stringify(requestBody),
   });
@@ -902,25 +937,31 @@ async function generateTextViaChatCompletionsApi(input: {
   debugHttpResponse(input.debug, response, bodyText);
   if (!response.ok) {
     throw new Error(
-      `Chat Completions API request failed (${response.status} ${response.statusText}).\nbody:\n${truncate(bodyText, 4000)}`,
+      `Chat Completions API fallback request failed (${response.status} ${response.statusText}).\nbody:\n${truncate(bodyText, 4000)}`,
     );
   }
 
-  const parsed = safeParseJson(bodyText);
+  const parsed = parseJsonPayload(bodyText);
   if (!parsed) {
-    throw new Error(`Invalid JSON response from Chat Completions API.\nbody:\n${truncate(bodyText, 4000)}`);
+    throw new Error(
+      `Invalid JSON response from Chat Completions API fallback.\nbody:\n${truncate(bodyText, 4000)}`,
+    );
   }
 
   const outputText = extractChatCompletionsText(parsed);
   if (!outputText) {
-    throw new Error("Chat Completions API returned no text output.");
+    throw new Error("Chat Completions API fallback returned no text output.");
   }
   return outputText;
 }
 
 function resolveUrl(baseUrl: string, path: string): string {
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  return new URL(normalizedPath, `${baseUrl.replace(/\/+$/, "")}/`).toString();
+  const url = new URL(baseUrl);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  const normalizedPath = path.replace(/^\/+/, "");
+  const joinedPath = [basePath, normalizedPath].filter(Boolean).join("/");
+  url.pathname = joinedPath.startsWith("/") ? joinedPath : `/${joinedPath}`;
+  return url.toString();
 }
 
 function safeParseJson(value: string): unknown {
@@ -929,6 +970,49 @@ function safeParseJson(value: string): unknown {
   } catch {
     return null;
   }
+}
+
+function parseJsonPayload(value: string): unknown {
+  const direct = safeParseJson(value);
+  if (direct) {
+    return direct;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const sseLines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .filter((line) => line && line !== "[DONE]");
+  if (sseLines.length > 0) {
+    const ssePayload = sseLines.join("\n");
+    const sseParsed = safeParseJson(ssePayload);
+    if (sseParsed) {
+      return sseParsed;
+    }
+  }
+
+  const doneIndex = trimmed.indexOf("data: [DONE]");
+  if (doneIndex > 0) {
+    const beforeDone = trimmed.slice(0, doneIndex).trim();
+    const beforeDoneParsed = safeParseJson(beforeDone);
+    if (beforeDoneParsed) {
+      return beforeDoneParsed;
+    }
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return safeParseJson(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  return null;
 }
 
 function extractResponsesOutputText(payload: unknown): string | null {
@@ -1041,6 +1125,69 @@ function maskSecret(value: string): string {
     return "***";
   }
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function createDebugFetch(enabled: boolean): typeof fetch | undefined {
+  if (!enabled) {
+    return undefined;
+  }
+
+  return async (input, init) => {
+    const request = input instanceof Request && init === undefined ? input : new Request(input, init);
+    const headers = sanitizeDebugHeaders(headersToRecord(request.headers));
+    const requestBody = await readRequestBodyForDebug(request);
+    debugHttpRequest(enabled, {
+      method: request.method,
+      url: request.url,
+      headers,
+      body: requestBody,
+    });
+
+    const response = await fetch(request);
+    const bodyText = await readResponseBodyForDebug(response);
+    debugHttpResponse(enabled, response, bodyText);
+    return response;
+  };
+}
+
+function headersToRecord(headers: Headers): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of headers.entries()) {
+    result[key] = value;
+  }
+  return result;
+}
+
+function sanitizeDebugHeaders(headers: Record<string, string>): Record<string, string> {
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === "authorization") {
+      const match = value.match(/^Bearer\s+(.+)$/i);
+      sanitized[key] = match ? `Bearer ${maskSecret(match[1])}` : maskSecret(value);
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+
+async function readRequestBodyForDebug(request: Request): Promise<string> {
+  if (request.method.toUpperCase() === "GET" || request.method.toUpperCase() === "HEAD") {
+    return "";
+  }
+  try {
+    return await request.clone().text();
+  } catch {
+    return "(unavailable)";
+  }
+}
+
+async function readResponseBodyForDebug(response: Response): Promise<string> {
+  try {
+    return await response.clone().text();
+  } catch {
+    return "(unavailable)";
+  }
 }
 
 function debugLog(enabled: boolean, message: string): void {
