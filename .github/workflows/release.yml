@@ -116,4 +116,4 @@ jobs:
           echo "Publishing version: $(npm pkg get version)"
 
       - name: Publish package to npm (OIDC trusted publishing)
-        run: npm publish
+        run: npm publish --provenance --access public
